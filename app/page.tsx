@@ -221,6 +221,8 @@ export default function Page() {
   const [participants, setParticipants] =
     useState<string[]>(INITIAL_PARTICIPANTS);
   const [newParticipantName, setNewParticipantName] = useState("");
+  const [newParticipantLevel, setNewParticipantLevel] = useState(4);
+  const [newParticipantGender, setNewParticipantGender] = useState<Gender>("M");
 
   // ▼ 各プレーヤーの設定（レベル・性別）
   const [playerSettings, setPlayerSettings] = useState<
@@ -249,12 +251,6 @@ export default function Page() {
         <div className="text-[11px] font-medium text-slate-800">{name}</div>
       </div>
     );
-  };
-
-  const playerLabel = (name: string): string => {
-    const s = getSettings(name);
-    const genderLabel = s.gender === "M" ? "男" : "女";
-    return `${name}（Lv${s.level}・${genderLabel}）`;
   };
 
   const updateSettings = (name: string, patch: Partial<PlayerSettings>) => {
@@ -319,9 +315,22 @@ export default function Page() {
   };
 
   const handleAddNewParticipant = () => {
-    if (!newParticipantName.trim()) return;
-    addParticipant(newParticipantName);
+    const name = newParticipantName.trim();
+    if (!name) return;
+
+    // 参加者として追加
+    addParticipant(name);
+
+    // この時点でレベル・性別も設定
+    updateSettings(name, {
+      level: newParticipantLevel,
+      gender: newParticipantGender,
+    });
+
+    // 入力欄をリセット
     setNewParticipantName("");
+    setNewParticipantLevel(4);
+    setNewParticipantGender("M");
   };
 
   const openPairPicker = (mode: "fixed" | "forbidden") => {
@@ -546,7 +555,7 @@ export default function Page() {
                   ※名前を入力して参加者に追加（レベル/性別は下の一覧で編集）
                 </span>
               </label>
-              <div className="flex gap-2">
+              <div className="flex flex-col gap-2 md:flex-row md:items-center">
                 <input
                   type="text"
                   value={newParticipantName}
@@ -554,13 +563,48 @@ export default function Page() {
                   placeholder="例）ビジターAさん"
                   className="flex-1 rounded-lg border border-slate-300 px-2 py-1.5 text-xs md:text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40"
                 />
-                <button
-                  type="button"
-                  onClick={handleAddNewParticipant}
-                  className="inline-flex items-center rounded-full bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white shadow-sm hover:bg-emerald-700 active:bg-emerald-800"
-                >
-                  追加
-                </button>
+
+                {/* レベルと性別の設定 */}
+                <div className="flex items-center gap-2 text-[11px]">
+                  <div className="flex items-center gap-1">
+                    <span className="text-slate-600">Lv</span>
+                    <select
+                      value={newParticipantLevel}
+                      onChange={(e) =>
+                        setNewParticipantLevel(Number(e.target.value) || 4)
+                      }
+                      className="rounded border border-slate-300 bg-white px-1.5 py-0.5"
+                    >
+                      {Array.from({ length: 8 }, (_, i) => i + 1).map((lv) => (
+                        <option key={lv} value={lv}>
+                          {lv}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="flex items-center gap-1">
+                    <span className="text-slate-600">性別</span>
+                    <select
+                      value={newParticipantGender}
+                      onChange={(e) =>
+                        setNewParticipantGender(e.target.value as Gender)
+                      }
+                      className="rounded border border-slate-300 bg-white px-1.5 py-0.5"
+                    >
+                      <option value="M">男</option>
+                      <option value="F">女</option>
+                    </select>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleAddNewParticipant}
+                    className="inline-flex items-center rounded-full bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white shadow-sm hover:bg-emerald-700 active:bg-emerald-800"
+                  >
+                    追加
+                  </button>
+                </div>
               </div>
             </div>
 
