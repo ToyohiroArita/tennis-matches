@@ -102,6 +102,7 @@ function getStoredState(): Partial<StoredState> | null {
 }
 
 // 配列シャッフル（フィッシャー–イェーツ）
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function shuffleArray<T>(array: T[]): T[] {
   const arr = [...array];
   for (let i = arr.length - 1; i > 0; i--) {
@@ -116,15 +117,20 @@ function pairKey(a: string, b: string): string {
   return `${x}::${y}`;
 }
 
-// 1試合分のペアを作る（前試合のペア＋固定ペア＋禁止ペア＋優先モードを考慮）
+// 1試合分のペアを作る
+// 前試合のペア＋固定ペア＋禁止ペア＋優先モード＋公平性（出場回数）を考慮
 function findRoundPairing(
   players: Player[],
   prevPairsSet: Set<string> | null,
   fixedPairs: Team[],
   forbiddenPairs: Team[],
-  priorityMode: PriorityMode
+  priorityMode: PriorityMode,
+  gamesCount: Record<string, number>,
+  lastPlayedRound: Record<string, number>
 ): { teams: Team[]; resting: string[] } | null {
-  const order = shuffleArray(players);
+  // ★ここでは並び替えはせず、外側から受け取った順序をそのまま使う
+  const order = [...players];
+
   const forbiddenSet = new Set(forbiddenPairs.map(([a, b]) => pairKey(a, b)));
 
   const fixedMap = new Map<string, string>();
@@ -156,20 +162,41 @@ function findRoundPairing(
       candidates = remaining.slice(1);
     }
 
-    // 優先ロジックに応じて候補を並び替え
+    // ★候補のソートに「出場回数」「最後に出たラウンド」を強く反映させる
     if (priorityMode === "level") {
-      candidates.sort(
-        (a, b) => Math.abs(a.level - p1.level) - Math.abs(b.level - p1.level)
-      );
-    } else if (priorityMode === "gender") {
-      const score = (p: Player) => (p.gender === p1.gender ? 1 : 0); // 0: 異性, 1: 同性
       candidates.sort((a, b) => {
-        const gDiff = score(a) - score(b);
-        if (gDiff !== 0) return gDiff; // 異性優先
-        return Math.abs(a.level - p1.level) - Math.abs(b.level - p1.level); // レベル差が小さい方
+        const ga = gamesCount[a.name] ?? 0;
+        const gb = gamesCount[b.name] ?? 0;
+        if (ga !== gb) return ga - gb; // 試合数が少ない方優先
+
+        const la = lastPlayedRound[a.name] ?? -1;
+        const lb = lastPlayedRound[b.name] ?? -1;
+        if (la !== lb) return la - lb; // 最近出ていない方優先
+
+        const da = Math.abs(a.level - p1.level);
+        const db = Math.abs(b.level - p1.level);
+        return da - db; // その次にレベル差が小さい方
+      });
+    } else if (priorityMode === "gender") {
+      candidates.sort((a, b) => {
+        const ga = gamesCount[a.name] ?? 0;
+        const gb = gamesCount[b.name] ?? 0;
+        if (ga !== gb) return ga - gb;
+
+        const la = lastPlayedRound[a.name] ?? -1;
+        const lb = lastPlayedRound[b.name] ?? -1;
+        if (la !== lb) return la - lb;
+
+        const genderScore = (p: Player) => (p.gender === p1.gender ? 1 : 0); // 0: 異性, 1: 同性
+        const gDiff = genderScore(a) - genderScore(b);
+        if (gDiff !== 0) return gDiff; // ★公平性が同じならここで「異性優先」
+
+        const da = Math.abs(a.level - p1.level);
+        const db = Math.abs(b.level - p1.level);
+        return da - db; // 最後にレベル差
       });
     }
-    // priorityMode === 'none' のときは shuffle 済み順のまま
+    // priorityMode === 'none' のときは、order の順番のまま（公平性は外側の並び順に任せる）
 
     for (const p2 of candidates) {
       const key = pairKey(p1.name, p2.name);
@@ -200,6 +227,7 @@ function findRoundPairing(
 }
 
 // 複数試合分を生成（1〜matchCount）
+// ★各プレーヤーの「試合数」と「最後に出たラウンド」を見て、なるべく公平に回す
 function generateRounds(
   players: Player[],
   courtCount: number,
@@ -209,19 +237,48 @@ function generateRounds(
   priorityMode: PriorityMode
 ): RoundView[] | null {
   const rounds: RoundView[] = [];
+
+  // 各プレーヤーの試合数と最後に出たラウンドを記録
+  const gamesCount: Record<string, number> = {};
+  const lastPlayedRound: Record<string, number> = {};
+
+  for (const p of players) {
+    gamesCount[p.name] = 0;
+    lastPlayedRound[p.name] = -1; // まだ一度も出ていない
+  }
+
+  // 直前ラウンドで組まれたペア（次のラウンドで同じペアを避ける）
   let prevPairsSet: Set<string> | null = null;
 
   for (let roundIndex = 0; roundIndex < matchCount; roundIndex++) {
     let result: { teams: Team[]; resting: string[] } | null = null;
 
+    // ★「試合数が少なく」「最近出ていない」人から優先して並べる
+    const sortedPlayers = [...players].sort((a, b) => {
+      const ga = gamesCount[a.name] ?? 0;
+      const gb = gamesCount[b.name] ?? 0;
+      if (ga !== gb) return ga - gb; // 試合数が少ない人を優先
+
+      const la = lastPlayedRound[a.name] ?? -1;
+      const lb = lastPlayedRound[b.name] ?? -1;
+      if (la !== lb) return la - lb; // 最近出ていない人を優先
+
+      // 同条件なら少しランダム性を入れる
+      return Math.random() - 0.5;
+    });
+
+    // バックトラッキングでペア決定（最大100回トライ）
     for (let attempt = 0; attempt < 100; attempt++) {
       result = findRoundPairing(
-        players,
+        sortedPlayers,
         prevPairsSet,
         fixedPairs,
         forbiddenPairs,
-        priorityMode
+        priorityMode,
+        gamesCount,
+        lastPlayedRound
       );
+
       if (result) break;
     }
 
@@ -235,6 +292,7 @@ function generateRounds(
     const courts: CourtMatch[] = [];
     const teamsForCourt = [...teams];
 
+    // 実際にコートで試合するペアを割り当て
     let courtNo = 1;
     while (courtNo <= courtCount && teamsForCourt.length >= 2) {
       const team1 = teamsForCourt.shift()!;
@@ -243,11 +301,33 @@ function generateRounds(
       courtNo++;
     }
 
+    // コートに割り当てられなかったペアは「休憩」に回す
     teamsForCourt.forEach((team) => {
       restingPlayers.push(...team);
     });
 
-    prevPairsSet = new Set(teams.map(([a, b]) => pairKey(a, b)));
+    // ★今回実際に「試合に出た人」だけ gamesCount / lastPlayedRound を更新
+    const playedThisRound = new Set<string>();
+    for (const court of courts) {
+      court.team1.forEach((name) => playedThisRound.add(name));
+      court.team2?.forEach((name) => playedThisRound.add(name));
+    }
+    for (const name of playedThisRound) {
+      gamesCount[name] = (gamesCount[name] ?? 0) + 1;
+      lastPlayedRound[name] = roundIndex;
+    }
+
+    // ★直前ラウンドのペア集合は「実際に試合したペア」のみ対象にする
+    const currentPairs: string[] = [];
+    for (const court of courts) {
+      if (court.team1.length === 2) {
+        currentPairs.push(pairKey(court.team1[0], court.team1[1]));
+      }
+      if (court.team2 && court.team2.length === 2) {
+        currentPairs.push(pairKey(court.team2[0], court.team2[1]));
+      }
+    }
+    prevPairsSet = new Set(currentPairs);
 
     rounds.push({ roundIndex, courts, restingPlayers });
   }
