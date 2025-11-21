@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
 type Gender = "M" | "F";
 
@@ -29,8 +29,8 @@ type Player = {
 
 type PriorityMode = "none" | "level" | "gender";
 
-// ▼ サークルメンバー「データベース」（名前だけ、設定は別stateで管理）
-const MEMBER_DATABASE: string[] = [
+// 在籍メンバーの初期値
+const INITIAL_MEMBERS: string[] = [
   "Aさん",
   "Bさん",
   "Cさん",
@@ -45,7 +45,7 @@ const MEMBER_DATABASE: string[] = [
   "Lさん",
 ];
 
-// 初期の参加者
+// 初期参加者（↑から何人か）
 const INITIAL_PARTICIPANTS: string[] = [
   "Aさん",
   "Bさん",
@@ -61,6 +61,45 @@ const DEFAULT_SETTINGS: PlayerSettings = {
   level: 4,
   gender: "M",
 };
+
+const STORAGE_KEY = "tennis-matches-state-v1";
+
+type StoredState = {
+  members: string[];
+  participants: string[];
+  playerSettings: Record<string, PlayerSettings>;
+  fixedPairs: Team[];
+  forbiddenPairs: Team[];
+  courtCount: number;
+  matchCount: number;
+  priorityMode: PriorityMode;
+};
+
+// localStorage から一度だけ読み込んでキャッシュする
+let cachedStoredState: Partial<StoredState> | null | undefined;
+
+function getStoredState(): Partial<StoredState> | null {
+  if (cachedStoredState !== undefined) {
+    return cachedStoredState;
+  }
+  if (typeof window === "undefined") {
+    cachedStoredState = null;
+    return null;
+  }
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      cachedStoredState = null;
+      return null;
+    }
+    const data = JSON.parse(raw) as Partial<StoredState>;
+    cachedStoredState = data;
+    return data;
+  } catch {
+    cachedStoredState = null;
+    return null;
+  }
+}
 
 // 配列シャッフル（フィッシャー–イェーツ）
 function shuffleArray<T>(array: T[]): T[] {
@@ -217,9 +256,28 @@ function generateRounds(
 }
 
 export default function Page() {
-  // ▼ この日の「参加者」リスト（メンバー＋ビジター）
-  const [participants, setParticipants] =
-    useState<string[]>(INITIAL_PARTICIPANTS);
+  // ▼ 在籍メンバー（サークルメンバーDB）
+  const [members, setMembers] = useState<string[]>(() => {
+    const stored = getStoredState();
+    if (stored && Array.isArray(stored.members)) {
+      return stored.members;
+    }
+    return INITIAL_MEMBERS;
+  });
+
+  // ▼ 今日の「参加者」リスト（メンバー＋ビジター）
+  const [participants, setParticipants] = useState<string[]>(() => {
+    const stored = getStoredState();
+    if (stored && Array.isArray(stored.participants)) {
+      return stored.participants;
+    }
+    return INITIAL_PARTICIPANTS;
+  });
+
+  // 新規メンバー追加用（モーダル内）
+  const [newMemberName, setNewMemberName] = useState("");
+
+  // 新規ビジター（参加者）追加用
   const [newParticipantName, setNewParticipantName] = useState("");
   const [newParticipantLevel, setNewParticipantLevel] = useState(4);
   const [newParticipantGender, setNewParticipantGender] = useState<Gender>("M");
@@ -227,12 +285,123 @@ export default function Page() {
   // ▼ 各プレーヤーの設定（レベル・性別）
   const [playerSettings, setPlayerSettings] = useState<
     Record<string, PlayerSettings>
-  >({});
+  >(() => {
+    const stored = getStoredState();
+    if (
+      stored &&
+      stored.playerSettings &&
+      typeof stored.playerSettings === "object"
+    ) {
+      return stored.playerSettings;
+    }
+    return {};
+  });
 
   const getSettings = (name: string): PlayerSettings => {
     return playerSettings[name] ?? DEFAULT_SETTINGS;
   };
 
+  const updateSettings = (name: string, patch: Partial<PlayerSettings>) => {
+    setPlayerSettings((prev) => {
+      const current = prev[name] ?? DEFAULT_SETTINGS;
+      return {
+        ...prev,
+        [name]: { ...current, ...patch },
+      };
+    });
+  };
+
+  // ▼ 制約：固定ペア・禁止ペア
+  const [fixedPairs, setFixedPairs] = useState<Team[]>(() => {
+    const stored = getStoredState();
+    if (stored && Array.isArray(stored.fixedPairs)) {
+      return stored.fixedPairs;
+    }
+    return [];
+  });
+
+  const [forbiddenPairs, setForbiddenPairs] = useState<Team[]>(() => {
+    const stored = getStoredState();
+    if (stored && Array.isArray(stored.forbiddenPairs)) {
+      return stored.forbiddenPairs;
+    }
+    return [];
+  });
+
+  // ▼ ペア追加用ポップアップ
+  const [pairPickerOpen, setPairPickerOpen] = useState<
+    null | "fixed" | "forbidden"
+  >(null);
+  const [pairPickerSelection, setPairPickerSelection] = useState<string[]>([]);
+
+  // ▼ メンバー管理 & 参加者追加用モーダル
+  const [memberModalOpen, setMemberModalOpen] = useState(false);
+  const [memberModalSelection, setMemberModalSelection] = useState<string[]>(
+    []
+  );
+
+  // ▼ 優先モード
+  const [priorityMode, setPriorityMode] = useState<PriorityMode>(() => {
+    const stored = getStoredState();
+    if (
+      stored &&
+      (stored.priorityMode === "none" ||
+        stored.priorityMode === "level" ||
+        stored.priorityMode === "gender")
+    ) {
+      return stored.priorityMode;
+    }
+    return "none";
+  });
+
+  // ▼ 条件
+  const [courtCount, setCourtCount] = useState(() => {
+    const stored = getStoredState();
+    if (stored && typeof stored.courtCount === "number") {
+      return stored.courtCount;
+    }
+    return 2;
+  });
+
+  const [matchCount, setMatchCount] = useState(() => {
+    const stored = getStoredState();
+    if (stored && typeof stored.matchCount === "number") {
+      return stored.matchCount;
+    }
+    return 3;
+  });
+
+  const [rounds, setRounds] = useState<RoundView[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // ▼ メンバー管理用関数
+  const addMember = (name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setMembers((prev) => (prev.includes(trimmed) ? prev : [...prev, trimmed]));
+  };
+
+  const removeMember = (name: string) => {
+    // 在籍メンバーから削除
+    setMembers((prev) => prev.filter((m) => m !== name));
+    // 参加者からも削除
+    setParticipants((prev) => prev.filter((p) => p !== name));
+    // 固定／禁止ペアから除外
+    setFixedPairs((prev) => prev.filter(([a, b]) => a !== name && b !== name));
+    setForbiddenPairs((prev) =>
+      prev.filter(([a, b]) => a !== name && b !== name)
+    );
+    // 設定も削除
+    setPlayerSettings((prev) => {
+      const copy = { ...prev };
+      delete copy[name];
+      return copy;
+    });
+    // モーダル内の選択からも外す
+    setMemberModalSelection((prev) => prev.filter((n) => n !== name));
+  };
+
+  // ▼ プレイヤーカード（名前 + Lv + 性別色）
   const PlayerCard = ({ name }: { name: string }) => {
     const s = getSettings(name);
     const isMale = s.gender === "M";
@@ -253,35 +422,6 @@ export default function Page() {
     );
   };
 
-  const updateSettings = (name: string, patch: Partial<PlayerSettings>) => {
-    setPlayerSettings((prev) => {
-      const current = prev[name] ?? DEFAULT_SETTINGS;
-      return {
-        ...prev,
-        [name]: { ...current, ...patch },
-      };
-    });
-  };
-
-  // ▼ 制約：固定ペア・禁止ペア
-  const [fixedPairs, setFixedPairs] = useState<Team[]>([]);
-  const [forbiddenPairs, setForbiddenPairs] = useState<Team[]>([]);
-
-  // ▼ ペア追加用ポップアップ
-  const [pairPickerOpen, setPairPickerOpen] = useState<
-    null | "fixed" | "forbidden"
-  >(null);
-  const [pairPickerSelection, setPairPickerSelection] = useState<string[]>([]);
-
-  // ▼ 優先モード
-  const [priorityMode, setPriorityMode] = useState<PriorityMode>("none");
-
-  // ▼ 条件
-  const [courtCount, setCourtCount] = useState(2);
-  const [matchCount, setMatchCount] = useState(3);
-  const [rounds, setRounds] = useState<RoundView[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
   const addParticipant = (name: string) => {
     const trimmed = name.trim();
     if (!trimmed) return;
@@ -298,30 +438,19 @@ export default function Page() {
     );
   };
 
-  const toggleMemberParticipant = (member: string) => {
-    setParticipants((prev) =>
-      prev.includes(member)
-        ? prev.filter((p) => p !== member)
-        : [...prev, member]
-    );
-    if (participants.includes(member)) {
-      setFixedPairs((prev) =>
-        prev.filter(([a, b]) => a !== member && b !== member)
-      );
-      setForbiddenPairs((prev) =>
-        prev.filter(([a, b]) => a !== member && b !== member)
-      );
-    }
+  const handleAddNewMember = () => {
+    addMember(newMemberName);
+    setNewMemberName("");
   };
 
   const handleAddNewParticipant = () => {
     const name = newParticipantName.trim();
     if (!name) return;
 
-    // 参加者として追加
+    // 参加者として追加（ビジター）
     addParticipant(name);
 
-    // この時点でレベル・性別も設定
+    // レベル・性別も同時に設定
     updateSettings(name, {
       level: newParticipantLevel,
       gender: newParticipantGender,
@@ -333,6 +462,35 @@ export default function Page() {
     setNewParticipantGender("M");
   };
 
+  // メンバー選択モーダル操作
+  const openMemberModal = () => {
+    setMemberModalOpen(true);
+    setMemberModalSelection([]);
+  };
+
+  const closeMemberModal = () => {
+    setMemberModalOpen(false);
+    setMemberModalSelection([]);
+  };
+
+  const toggleMemberModalSelection = (name: string) => {
+    setMemberModalSelection((prev) =>
+      prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]
+    );
+  };
+
+  const handleAddMembersToParticipants = () => {
+    if (memberModalSelection.length > 0) {
+      setParticipants((prev) => {
+        const set = new Set(prev);
+        memberModalSelection.forEach((n) => set.add(n));
+        return Array.from(set);
+      });
+    }
+    closeMemberModal();
+  };
+
+  // ペア選択モーダル
   const openPairPicker = (mode: "fixed" | "forbidden") => {
     setPairPickerOpen(mode);
     setPairPickerSelection([]);
@@ -439,11 +597,40 @@ export default function Page() {
     }
   };
 
+  // ▼ 状態が変わるたびに localStorage に保存
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const data: StoredState = {
+      members,
+      participants,
+      playerSettings,
+      fixedPairs,
+      forbiddenPairs,
+      courtCount,
+      matchCount,
+      priorityMode,
+    };
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    } catch (e) {
+      console.error("Failed to save state to localStorage", e);
+    }
+  }, [
+    members,
+    participants,
+    playerSettings,
+    fixedPairs,
+    forbiddenPairs,
+    courtCount,
+    matchCount,
+    priorityMode,
+  ]);
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-sky-50 via-slate-50 to-emerald-50 px-3 py-6 md:px-6 md:py-10">
       <div className="mx-auto flex max-w-6xl flex-col gap-4 md:flex-row">
         {/* 左側：参加者・条件の設定パネル */}
-        <section className="w-full space-y-4 md:w-[45%]">
+        <section className="w全 space-y-4 md:w-[45%]">
           {/* タイトル */}
           <div className="rounded-2xl bg-white/90 p-4 shadow-md ring-1 ring-slate-200 md:p-5">
             <div className="mb-3 flex items-center justify-between gap-2">
@@ -475,76 +662,29 @@ export default function Page() {
                 </span>
               </div>
               <span className="text-[11px] text-slate-500">
-                メンバーDB: {MEMBER_DATABASE.length} 名
+                サークルメンバー: {members.length} 名
               </span>
             </div>
           </div>
 
-          {/* 参加者設定 */}
+          {/* 参加者設定（メイン画面） */}
           <div className="rounded-2xl bg-white/90 p-4 shadow-md ring-1 ring-slate-200 md:p-5">
             <h2 className="mb-2 text-sm font-semibold text-slate-800">
-              参加者の設定
+              今日の参加者の設定
             </h2>
 
-            {/* サークルメンバー一覧 */}
-            <div className="mb-3">
-              <div className="mb-1 flex items-center justify-between text-[11px] text-slate-600">
-                <span>サークルメンバー（チェックすると参加者に登録）</span>
-                <span>レベル/性別は右で設定</span>
+            {/* メンバーから追加ボタン */}
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <div className="text-[11px] text-slate-600">
+                サークル在籍メンバーを一覧で確認し、そこから今日の参加者を追加できます。
               </div>
-              <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs">
-                {MEMBER_DATABASE.map((member) => {
-                  const checked = participants.includes(member);
-                  const s = getSettings(member);
-                  return (
-                    <div
-                      key={member}
-                      className="flex items-center justify-between rounded-md px-1 py-0.5 hover:bg-sky-50"
-                    >
-                      <label className="flex flex-1 cursor-pointer items-center gap-1.5">
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={() => toggleMemberParticipant(member)}
-                          className="h-3.5 w-3.5 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
-                        />
-                        <span>{member}</span>
-                      </label>
-                      <div className="flex items-center gap-1.5 text-[10px]">
-                        <select
-                          value={s.level}
-                          onChange={(e) =>
-                            updateSettings(member, {
-                              level: Number(e.target.value) || 4,
-                            })
-                          }
-                          className="rounded border border-slate-300 bg-white px-1 py-0.5"
-                        >
-                          {Array.from({ length: 8 }, (_, i) => i + 1).map(
-                            (lv) => (
-                              <option key={lv} value={lv}>
-                                Lv{lv}
-                              </option>
-                            )
-                          )}
-                        </select>
-                        <select
-                          value={s.gender}
-                          onChange={(e) =>
-                            updateSettings(member, {
-                              gender: e.target.value as Gender,
-                            })
-                          }
-                          className="rounded border border-slate-300 bg-white px-1 py-0.5"
-                        >
-                          <option value="M">男</option>
-                          <option value="F">女</option>
-                        </select>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
+              <button
+                type="button"
+                onClick={openMemberModal}
+                className="inline-flex items-center rounded-full bg-slate-800 px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm hover:bg-slate-900"
+              >
+                メンバー一覧を開く
+              </button>
             </div>
 
             {/* ビジター・個別追加 */}
@@ -552,7 +692,7 @@ export default function Page() {
               <label className="mb-1 block text-xs font-semibold text-slate-700">
                 ビジター / 個別追加
                 <span className="ml-1 text-[11px] font-normal text-slate-500">
-                  ※名前を入力して参加者に追加（レベル/性別は下の一覧で編集）
+                  ※名前・レベル・性別を設定して今日の参加者に追加
                 </span>
               </label>
               <div className="flex flex-col gap-2 md:flex-row md:items-center">
@@ -564,7 +704,6 @@ export default function Page() {
                   className="flex-1 rounded-lg border border-slate-300 px-2 py-1.5 text-xs md:text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40"
                 />
 
-                {/* レベルと性別の設定 */}
                 <div className="flex items-center gap-2 text-[11px]">
                   <div className="flex items-center gap-1">
                     <span className="text-slate-600">Lv</span>
@@ -612,15 +751,15 @@ export default function Page() {
             <div className="mb-3">
               <div className="mb-1 flex items-center justify-between">
                 <span className="text-xs font-semibold text-slate-700">
-                  現在の参加者
+                  今日の参加者
                 </span>
                 <span className="text-[11px] text-slate-500">
-                  バッジをクリックで削除
+                  バッジをクリックで参加者から削除（在籍は残ります）
                 </span>
               </div>
               {participants.length === 0 ? (
                 <p className="rounded-lg bg-slate-50 px-3 py-2 text-[11px] text-slate-500">
-                  まだ参加者が登録されていません。メンバーにチェックを入れるか、ビジターを追加してください。
+                  まだ参加者が登録されていません。メンバー一覧を開くか、ビジターを追加してください。
                 </p>
               ) : (
                 <div className="flex flex-wrap gap-1.5 rounded-lg bg-slate-50 px-2.5 py-2">
@@ -1036,6 +1175,127 @@ export default function Page() {
                 }`}
               >
                 追加
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* メンバー管理 & 参加者追加モーダル */}
+      {memberModalOpen && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/30 px-3">
+          <div className="w-full max-w-md rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
+            <h3 className="mb-1 text-sm font-semibold text-slate-800">
+              サークルメンバー管理 & 参加者追加
+            </h3>
+            <p className="mb-2 text-[11px] text-slate-500">
+              サークル在籍メンバーを管理し、今日の参加者として追加したい人にチェックを入れてください。
+            </p>
+
+            {/* メンバー追加 */}
+            <div className="mb-2 flex flex-col gap-2 md:flex-row md:items-center">
+              <input
+                type="text"
+                value={newMemberName}
+                onChange={(e) => setNewMemberName(e.target.value)}
+                placeholder="例）佐藤さん"
+                className="flex-1 rounded-lg border border-slate-300 px-2 py-1.5 text-xs md:text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40"
+              />
+              <button
+                type="button"
+                onClick={handleAddNewMember}
+                className="inline-flex items-center justify-center rounded-full bg-slate-800 px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm hover:bg-slate-900"
+              >
+                メンバー追加
+              </button>
+            </div>
+
+            {/* メンバー一覧 */}
+            <div className="max-h-64 space-y-1 overflow-y-auto rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs">
+              {members.length === 0 && (
+                <p className="px-1 py-1 text-[11px] text-slate-500">
+                  まだサークルメンバーが登録されていません。上の欄から追加してください。
+                </p>
+              )}
+              {members.map((name) => {
+                const checked = memberModalSelection.includes(name);
+                const s = getSettings(name);
+                return (
+                  <div
+                    key={name}
+                    className="flex items-center justify-between gap-1 rounded-md px-1 py-0.5 hover:bg-sky-50"
+                  >
+                    <label className="flex flex-1 cursor-pointer items-center gap-1.5">
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleMemberModalSelection(name)}
+                        className="h-3.5 w-3.5 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                      />
+                      <span className="truncate">{name}</span>
+                    </label>
+                    <div className="flex items-center gap-1.5 text-[10px]">
+                      <select
+                        value={s.level}
+                        onChange={(e) =>
+                          updateSettings(name, {
+                            level: Number(e.target.value) || 4,
+                          })
+                        }
+                        className="rounded border border-slate-300 bg-white px-1 py-0.5"
+                      >
+                        {Array.from({ length: 8 }, (_, i) => i + 1).map(
+                          (lv) => (
+                            <option key={lv} value={lv}>
+                              Lv{lv}
+                            </option>
+                          )
+                        )}
+                      </select>
+                      <select
+                        value={s.gender}
+                        onChange={(e) =>
+                          updateSettings(name, {
+                            gender: e.target.value as Gender,
+                          })
+                        }
+                        className="rounded border border-slate-300 bg-white px-1 py-0.5"
+                      >
+                        <option value="M">男</option>
+                        <option value="F">女</option>
+                      </select>
+                      <button
+                        type="button"
+                        onClick={() => removeMember(name)}
+                        className="rounded-full bg-red-50 px-2 py-0.5 text-[10px] text-red-600 hover:bg-red-100"
+                      >
+                        削除
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="mt-3 flex justify-end gap-2 text-xs">
+              <button
+                type="button"
+                onClick={closeMemberModal}
+                className="rounded-full border border-slate-300 px-3 py-1.5 text-slate-600 hover:bg-slate-50"
+              >
+                閉じる
+              </button>
+              <button
+                type="button"
+                onClick={handleAddMembersToParticipants}
+                disabled={memberModalSelection.length === 0}
+                className={`rounded-full px-3 py-1.5 font-semibold text-white ${
+                  memberModalSelection.length > 0
+                    ? "bg-sky-600 hover:bg-sky-700"
+                    : "cursor-not-allowed bg-sky-300"
+                }`}
+              >
+                参加者に追加
               </button>
             </div>
           </div>
