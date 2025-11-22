@@ -1,10 +1,10 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 
 type Gender = "M" | "F";
 
-type Team = [string, string]; // ペア（2人）: 名前
+type Team = [string, string];
 type CourtMatch = {
   court: number;
   team1: string[];
@@ -14,11 +14,11 @@ type RoundView = {
   roundIndex: number;
   courts: CourtMatch[];
   restingPlayers: string[];
-  score?: number; // ★ デバッグ用スコア
+  score?: number;
 };
 
 type PlayerSettings = {
-  level: number; // 1〜8
+  level: number;
   gender: Gender;
 };
 
@@ -30,8 +30,7 @@ type Player = {
 
 type PriorityMode = "none" | "level" | "gender";
 
-// 在籍メンバーの初期値
-const INITIAL_MEMBERS: string[] = [
+const MEMBER_DATABASE: string[] = [
   "Aさん",
   "Bさん",
   "Cさん",
@@ -46,7 +45,6 @@ const INITIAL_MEMBERS: string[] = [
   "Lさん",
 ];
 
-// 初期参加者（↑から何人か）
 const INITIAL_PARTICIPANTS: string[] = [
   "Aさん",
   "Bさん",
@@ -66,7 +64,6 @@ const DEFAULT_SETTINGS: PlayerSettings = {
 const STORAGE_KEY = "tennis-matches-state-v1";
 
 type StoredState = {
-  members: string[];
   participants: string[];
   playerSettings: Record<string, PlayerSettings>;
   fixedPairs: Team[];
@@ -76,34 +73,6 @@ type StoredState = {
   priorityMode: PriorityMode;
 };
 
-// localStorage から一度だけ読み込んでキャッシュする
-let cachedStoredState: Partial<StoredState> | null | undefined;
-
-function getStoredState(): Partial<StoredState> | null {
-  if (cachedStoredState !== undefined) {
-    return cachedStoredState;
-  }
-  if (typeof window === "undefined") {
-    cachedStoredState = null;
-    return null;
-  }
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) {
-      cachedStoredState = null;
-      return null;
-    }
-    const data = JSON.parse(raw) as Partial<StoredState>;
-    cachedStoredState = data;
-    return data;
-  } catch {
-    cachedStoredState = null;
-    return null;
-  }
-}
-
-// 配列シャッフル（フィッシャー–イェーツ）
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function shuffleArray<T>(array: T[]): T[] {
   const arr = [...array];
   for (let i = arr.length - 1; i > 0; i--) {
@@ -119,160 +88,18 @@ function pairKey(a: string, b: string): string {
 }
 
 function matchupKey(team1: Team, team2: Team): string {
-  // 4人分の名前をソートして一意なキーにする（順番・コートは関係なく同じ対戦とみなす）
   const names = [...team1, ...team2].sort();
   return names.join("::");
 }
 
-// 1ラウンド分の組み合わせにスコアを付ける
-// スコアが小さいほど「良い」案
-function scoreCandidateRound(
-  courts: CourtMatch[],
-  roundIndex: number,
-  gamesCount: Record<string, number>,
-  lastPlayedRound: Record<string, number>,
-  levelMap: Record<string, number>,
-  pastMatchupLastRound: Map<string, number>,
-  pastMatchupCount: Map<string, number>,
-  fixedPairs: Team[]
-): number {
-  let score = 0;
-
-  // このラウンドで試合に出るプレーヤー集合
-  const playedThisRound = new Set<string>();
-  for (const court of courts) {
-    court.team1.forEach((name) => playedThisRound.add(name));
-    court.team2?.forEach((name) => playedThisRound.add(name));
-  }
-
-  // ① 連続出場ペナルティ（前ラウンドも出ていた人）
-  for (const name of playedThisRound) {
-    if ((lastPlayedRound[name] ?? -1) === roundIndex - 1) {
-      score += 3; // 連続出場1人あたり +3
-    }
-  }
-
-  // このラウンドの「どのプレーヤーがどのチームか」をマッピング
-  const teamIdByPlayer: Record<string, string> = {};
-  for (const court of courts) {
-    const t1id = `R${roundIndex}-C${court.court}-T1`;
-    const t2id = `R${roundIndex}-C${court.court}-T2`;
-    court.team1.forEach((name) => {
-      teamIdByPlayer[name] = t1id;
-    });
-    court.team2?.forEach((name) => {
-      teamIdByPlayer[name] = t2id;
-    });
-  }
-
-  // ② 固定ペアの扱い（ペナルティ方式）
-  for (const [a, b] of fixedPairs) {
-    const aIn = playedThisRound.has(a);
-    const bIn = playedThisRound.has(b);
-
-    if (aIn && bIn) {
-      const ta = teamIdByPlayer[a];
-      const tb = teamIdByPlayer[b];
-      if (ta && tb) {
-        if (ta === tb) {
-          // 同じチームで出場 → ちょっとだけご褒美
-          score -= 5;
-        } else {
-          // 同じラウンドに出ているのに別チーム → ペナルティ（少し軽め）
-          score += 20;
-        }
-      }
-    }
-    // 片方だけ出ている / 片方休憩は今回はノーペナルティにしておく
-  }
-
-  // ③ レベル差 & 同じ対戦の繰り返し
-  for (const court of courts) {
-    if (!court.team2) continue; // 相手チームがいない場合はスキップ
-
-    const sum1 = court.team1.reduce(
-      (acc, name) => acc + (levelMap[name] ?? 4),
-      0
-    );
-    const sum2 = court.team2.reduce(
-      (acc, name) => acc + (levelMap[name] ?? 4),
-      0
-    );
-    const diff = Math.abs(sum1 - sum2);
-
-    // レベル差ペナルティ：差2まではOK、超えた分だけ二乗で重くする
-    if (diff > 2) {
-      const over = diff - 2;
-      score += over * over * 10; // 重み10（必要に応じてチューニング）
-    }
-
-    // 同じ4人カードの繰り返し
-    const key = matchupKey(court.team1 as Team, court.team2 as Team);
-    const lastRound = pastMatchupLastRound.get(key);
-    const countSoFar = pastMatchupCount.get(key) ?? 0; // これまで何回この4人で対戦したか
-
-    if (lastRound !== undefined) {
-      const gap = roundIndex - lastRound; // 何試合ぶりか
-
-      // 他のペナルティ（レベル差・出場回数など）がせいぜい数百〜数千点なので、
-      // ここは「桁を2〜3つ」上げて、ほぼ禁止レベルにする。
-      const HARD_BASE = 1_000_000; // 基本スケール
-
-      let basePenalty = 0;
-      if (gap <= 5) {
-        // 5試合以内に同じ4人は、原則ほぼNG
-        basePenalty = HARD_BASE;
-      } else if (gap <= 10) {
-        // 6〜10試合ぶりでもかなり重め
-        basePenalty = HARD_BASE / 5; // 200,000
-      } else {
-        // それ以降は「たまには同じ対戦もあり」程度だが、それでもそこそこ重い
-        basePenalty = HARD_BASE / 20; // 50,000
-      }
-
-      // 繰り返し回数による増幅：
-      // 2回目: (1+1)^2 = 4倍, 3回目: 9倍, 4回目: 16倍...
-      const repeatFactor = (countSoFar + 1) * (countSoFar + 1);
-
-      score += basePenalty * repeatFactor;
-    }
-  }
-
-  // ④ 出場回数の偏り（この案を採用した場合の仮の gamesCount で評価）
-  const tmpGames: Record<string, number> = { ...gamesCount };
-  for (const name of playedThisRound) {
-    tmpGames[name] = (tmpGames[name] ?? 0) + 1;
-  }
-
-  let minGames = Infinity;
-  let maxGames = -Infinity;
-  for (const name in tmpGames) {
-    const g = tmpGames[name];
-    if (g < minGames) minGames = g;
-    if (g > maxGames) maxGames = g;
-  }
-
-  if (minGames !== Infinity && maxGames !== -Infinity) {
-    const diffGames = maxGames - minGames;
-    score += diffGames * 4; // 出場回数の差 ×4
-  }
-
-  return score;
-}
-
-// 1試合分のペアを作る
-// 前試合のペア＋禁止ペア＋優先モード＋公平性（出場回数）を考慮
+// 1試合分のペアを作る（前試合ペア・禁止ペア・優先モードを考慮）
 function findRoundPairing(
   players: Player[],
   prevPairsSet: Set<string> | null,
-  fixedPairs: Team[], // ★ ここでは使わず、スコア側で評価する
   forbiddenPairs: Team[],
-  priorityMode: PriorityMode,
-  gamesCount: Record<string, number>,
-  lastPlayedRound: Record<string, number>
+  priorityMode: PriorityMode
 ): { teams: Team[]; resting: string[] } | null {
-  const order = [...players];
-
+  const order = shuffleArray(players);
   const forbiddenSet = new Set(forbiddenPairs.map(([a, b]) => pairKey(a, b)));
 
   const used = new Set<string>();
@@ -287,46 +114,23 @@ function findRoundPairing(
     const p1 = remaining[0];
     let candidates: Player[] = remaining.slice(1);
 
-    // ★候補のソートに「出場回数」「最後に出たラウンド」も反映しつつ、
-    //   level / gender の優先モードを加味する
     if (priorityMode === "level") {
-      candidates.sort((a, b) => {
-        const ga = gamesCount[a.name] ?? 0;
-        const gb = gamesCount[b.name] ?? 0;
-        if (ga !== gb) return ga - gb; // 試合数が少ない方優先
-
-        const la = lastPlayedRound[a.name] ?? -1;
-        const lb = lastPlayedRound[b.name] ?? -1;
-        if (la !== lb) return la - lb; // 最近出ていない方優先
-
-        const da = Math.abs(a.level - p1.level);
-        const db = Math.abs(b.level - p1.level);
-        return da - db; // その次にレベル差が小さい方
-      });
+      candidates.sort(
+        (a, b) => Math.abs(a.level - p1.level) - Math.abs(b.level - p1.level)
+      );
     } else if (priorityMode === "gender") {
+      const genderScore = (p: Player) => (p.gender === p1.gender ? 1 : 0); // 0: 異性, 1: 同性
       candidates.sort((a, b) => {
-        const ga = gamesCount[a.name] ?? 0;
-        const gb = gamesCount[b.name] ?? 0;
-        if (ga !== gb) return ga - gb;
-
-        const la = lastPlayedRound[a.name] ?? -1;
-        const lb = lastPlayedRound[b.name] ?? -1;
-        if (la !== lb) return la - lb;
-
-        const genderScore = (p: Player) => (p.gender === p1.gender ? 1 : 0); // 0: 異性, 1: 同性
         const gDiff = genderScore(a) - genderScore(b);
-        if (gDiff !== 0) return gDiff; // ★公平性が同じならここで「異性優先」
-
+        if (gDiff !== 0) return gDiff; // 異性優先
         const da = Math.abs(a.level - p1.level);
         const db = Math.abs(b.level - p1.level);
-        return da - db; // 最後にレベル差
+        return da - db; // 次にレベル差
       });
     }
-    // priorityMode === 'none' のときは、order の順番のまま（公平性は外側の並び順に任せる）
 
     for (const p2 of candidates) {
       const key = pairKey(p1.name, p2.name);
-
       if (forbiddenSet.has(key)) continue;
       if (prevPairsSet && prevPairsSet.has(key)) continue; // 直前と同じペアは禁止
 
@@ -348,13 +152,107 @@ function findRoundPairing(
   if (!ok) return null;
 
   const resting = order.filter((p) => !used.has(p.name)).map((p) => p.name);
-
   return { teams, resting };
 }
 
-// 複数試合分を生成（1〜matchCount）
-// 公平性（出場回数・連続出場）とレベル差、同じ対戦の繰り返しをスコアリングして、
-// スコアが最小の案を各ラウンドで採用する。
+// 1ラウンド分をスコアリング（スコアが小さいほど「良い」）
+function scoreCandidateRound(
+  courts: CourtMatch[],
+  roundIndex: number,
+  gamesCount: Record<string, number>,
+  lastPlayedRound: Record<string, number>,
+  levelMap: Record<string, number>,
+  pastMatchupLastRound: Map<string, number>,
+  pastMatchupCount: Map<string, number>,
+  fixedPairs: Team[]
+): number {
+  let score = 0;
+
+  const playedThisRound = new Set<string>();
+  for (const court of courts) {
+    court.team1.forEach((name) => playedThisRound.add(name));
+    court.team2?.forEach((name) => playedThisRound.add(name));
+  }
+
+  // ① 連続出場ペナルティ
+  for (const name of playedThisRound) {
+    if ((lastPlayedRound[name] ?? -1) === roundIndex - 1) {
+      score += 3;
+    }
+  }
+
+  // このラウンドのチームIDマップ（固定ペア評価用）
+  const teamIdByPlayer: Record<string, string> = {};
+  for (const court of courts) {
+    const t1id = `R${roundIndex}-C${court.court}-T1`;
+    const t2id = `R${roundIndex}-C${court.court}-T2`;
+    court.team1.forEach((name) => {
+      teamIdByPlayer[name] = t1id;
+    });
+    court.team2?.forEach((name) => {
+      teamIdByPlayer[name] = t2id;
+    });
+  }
+
+  // ② 固定ペア（ソフト制約）
+  for (const [a, b] of fixedPairs) {
+    const aIn = playedThisRound.has(a);
+    const bIn = playedThisRound.has(b);
+    if (aIn && bIn) {
+      const ta = teamIdByPlayer[a];
+      const tb = teamIdByPlayer[b];
+      if (ta && tb) {
+        if (ta === tb) {
+          // 同じチームで出たらちょっとご褒美
+          score -= 5;
+        } else {
+          // 同じラウンドで別チームならペナルティ
+          score += 20;
+        }
+      }
+    }
+  }
+
+  // ③ レベル差
+  for (const court of courts) {
+    if (!court.team2) continue;
+    const sum1 = court.team1.reduce(
+      (acc, name) => acc + (levelMap[name] ?? 4),
+      0
+    );
+    const sum2 = court.team2.reduce(
+      (acc, name) => acc + (levelMap[name] ?? 4),
+      0
+    );
+    const diff = Math.abs(sum1 - sum2);
+    if (diff > 2) {
+      const over = diff - 2;
+      score += over * over * 10; // 差が大きいほど急増
+    }
+  }
+
+  // ④ 出場回数の偏り（この案を採用した場合の仮 gamesCount）
+  const tmpGames: Record<string, number> = { ...gamesCount };
+  for (const name of playedThisRound) {
+    tmpGames[name] = (tmpGames[name] ?? 0) + 1;
+  }
+
+  let minGames = Infinity;
+  let maxGames = -Infinity;
+  for (const name in tmpGames) {
+    const g = tmpGames[name];
+    if (g < minGames) minGames = g;
+    if (g > maxGames) maxGames = g;
+  }
+  if (minGames !== Infinity && maxGames !== -Infinity) {
+    const diffGames = maxGames - minGames;
+    score += diffGames * 4;
+  }
+
+  return score;
+}
+
+// 複数ラウンド生成
 function generateRounds(
   players: Player[],
   courtCount: number,
@@ -365,23 +263,19 @@ function generateRounds(
 ): RoundView[] | null {
   const rounds: RoundView[] = [];
 
-  // 各プレーヤーの試合数と最後に出たラウンド
   const gamesCount: Record<string, number> = {};
   const lastPlayedRound: Record<string, number> = {};
   const levelMap: Record<string, number> = {};
-
   for (const p of players) {
     gamesCount[p.name] = 0;
     lastPlayedRound[p.name] = -1;
     levelMap[p.name] = p.level;
   }
 
-  // 直前ラウンドで実際に試合したペア集合（次ラウンドで同じペアを禁止するため）
   let prevPairsSet: Set<string> | null = null;
 
-  // 過去の「対戦カード（4人）」の最後に出たラウンド
+  // 同じ4人カードの履歴
   const pastMatchupLastRound = new Map<string, number>();
-  // 過去の「対戦カード（4人）」が何回登場したか
   const pastMatchupCount = new Map<string, number>();
 
   for (let roundIndex = 0; roundIndex < matchCount; roundIndex++) {
@@ -390,9 +284,8 @@ function generateRounds(
     let bestResting: string[] = [];
     let bestTeamsForPrevPairs: Team[] | null = null;
 
-    // 同じ条件で複数パターンを試して、一番スコアの良いものを採用
     for (let attempt = 0; attempt < 60; attempt++) {
-      // 公平性を考慮して並び替え（試合数が少ない & 最近出ていない人を優先）
+      // 出場回数が少ない人・最近出ていない人から優先的に並べる
       const sortedPlayers = [...players].sort((a, b) => {
         const ga = gamesCount[a.name] ?? 0;
         const gb = gamesCount[b.name] ?? 0;
@@ -402,22 +295,20 @@ function generateRounds(
         const lb = lastPlayedRound[b.name] ?? -1;
         if (la !== lb) return la - lb;
 
-        return Math.random() - 0.5; // 完全同条件ならランダム
+        return Math.random() - 0.5;
       });
 
       const pairing = findRoundPairing(
         sortedPlayers,
         prevPairsSet,
-        fixedPairs,
         forbiddenPairs,
-        priorityMode,
-        gamesCount,
-        lastPlayedRound
+        priorityMode
       );
       if (!pairing) continue;
 
       const teams = pairing.teams;
       const restingPlayers = [...pairing.resting];
+
       const courts: CourtMatch[] = [];
       const teamsForCourt = [...teams];
 
@@ -428,12 +319,31 @@ function generateRounds(
         courts.push({ court: courtNo, team1, team2 });
         courtNo++;
       }
-      // コートに載りきれなかったペアは休憩扱い
       teamsForCourt.forEach((team) => {
         restingPlayers.push(...team);
       });
 
-      // ★ この案のスコアを計算
+      // ★ 同じ4人カードのハード禁止：直近10試合以内はNG
+      const ALLOW_SAME_FOUR_AFTER_ROUNDS = 10;
+      let invalidDueToSame4 = false;
+
+      for (const court of courts) {
+        if (!court.team2) continue;
+        const key = matchupKey(court.team1 as Team, court.team2 as Team);
+        const lastRound = pastMatchupLastRound.get(key);
+        if (lastRound !== undefined) {
+          const gap = roundIndex - lastRound;
+          if (gap < ALLOW_SAME_FOUR_AFTER_ROUNDS) {
+            invalidDueToSame4 = true;
+            break;
+          }
+        }
+      }
+
+      if (invalidDueToSame4) {
+        continue; // この案は捨てて別の案を試す
+      }
+
       const score = scoreCandidateRound(
         courts,
         roundIndex,
@@ -450,18 +360,14 @@ function generateRounds(
         bestCourts = courts;
         bestResting = restingPlayers;
         bestTeamsForPrevPairs = teams;
-
-        // 全てのペナルティが0なら理想案なので、ここで打ち切り
         if (score === 0) break;
       }
     }
 
-    // このラウンドの案がどうしても見つからなかった場合
     if (!bestCourts || !bestTeamsForPrevPairs) {
       return null;
     }
 
-    // 実際に試合に出た人だけ、出場回数・最終出場ラウンドを更新
     const playedThisRound = new Set<string>();
     for (const court of bestCourts) {
       court.team1.forEach((name) => playedThisRound.add(name));
@@ -472,7 +378,6 @@ function generateRounds(
       lastPlayedRound[name] = roundIndex;
     }
 
-    // 次ラウンドで「直前ペア禁止」にする集合を更新
     const currentPairs: string[] = [];
     for (const court of bestCourts) {
       if (court.team1.length === 2) {
@@ -484,16 +389,12 @@ function generateRounds(
     }
     prevPairsSet = new Set(currentPairs);
 
-    // 対戦カード（4人）の履歴を更新
+    // 同じ4人カードの履歴更新
     for (const court of bestCourts) {
       if (!court.team2) continue;
       const key = matchupKey(court.team1 as Team, court.team2 as Team);
-
-      // 最後に出たラウンド番号
-      pastMatchupLastRound.set(key, roundIndex);
-
-      // 出現回数
       const prevCount = pastMatchupCount.get(key) ?? 0;
+      pastMatchupLastRound.set(key, roundIndex);
       pastMatchupCount.set(key, prevCount + 1);
     }
 
@@ -501,7 +402,7 @@ function generateRounds(
       roundIndex,
       courts: bestCourts,
       restingPlayers: bestResting,
-      score: bestScore, // ★ このラウンドで採用された案のスコア
+      score: bestScore,
     });
   }
 
@@ -509,50 +410,125 @@ function generateRounds(
 }
 
 export default function Page() {
-  // ▼ 在籍メンバー（サークルメンバーDB）
-  const [members, setMembers] = useState<string[]>(() => {
-    const stored = getStoredState();
-    if (stored && Array.isArray(stored.members)) {
-      return stored.members;
-    }
-    return INITIAL_MEMBERS;
-  });
-
-  // ▼ 今日の「参加者」リスト（メンバー＋ビジター）
+  // localStorage 初期値読み込み
   const [participants, setParticipants] = useState<string[]>(() => {
-    const stored = getStoredState();
-    if (stored && Array.isArray(stored.participants)) {
-      return stored.participants;
+    if (typeof window === "undefined") return INITIAL_PARTICIPANTS;
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return INITIAL_PARTICIPANTS;
+      const data = JSON.parse(raw) as Partial<StoredState>;
+      if (Array.isArray(data.participants) && data.participants.length > 0) {
+        return data.participants;
+      }
+      return INITIAL_PARTICIPANTS;
+    } catch {
+      return INITIAL_PARTICIPANTS;
     }
-    return INITIAL_PARTICIPANTS;
   });
 
-  // 新規メンバー追加用（モーダル内）
-  const [newMemberName, setNewMemberName] = useState("");
+  const [playerSettings, setPlayerSettings] = useState<
+    Record<string, PlayerSettings>
+  >(() => {
+    if (typeof window === "undefined") return {};
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return {};
+      const data = JSON.parse(raw) as Partial<StoredState>;
+      if (data.playerSettings && typeof data.playerSettings === "object") {
+        return data.playerSettings;
+      }
+      return {};
+    } catch {
+      return {};
+    }
+  });
 
-  // 新規ビジター（参加者）追加用
+  const [fixedPairs, setFixedPairs] = useState<Team[]>(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return [];
+      const data = JSON.parse(raw) as Partial<StoredState>;
+      if (Array.isArray(data.fixedPairs)) return data.fixedPairs as Team[];
+      return [];
+    } catch {
+      return [];
+    }
+  });
+
+  const [forbiddenPairs, setForbiddenPairs] = useState<Team[]>(() => {
+    if (typeof window === "undefined") return [];
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return [];
+      const data = JSON.parse(raw) as Partial<StoredState>;
+      if (Array.isArray(data.forbiddenPairs))
+        return data.forbiddenPairs as Team[];
+      return [];
+    } catch {
+      return [];
+    }
+  });
+
+  const [courtCount, setCourtCount] = useState<number>(() => {
+    if (typeof window === "undefined") return 2;
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return 2;
+      const data = JSON.parse(raw) as Partial<StoredState>;
+      if (typeof data.courtCount === "number") return data.courtCount;
+      return 2;
+    } catch {
+      return 2;
+    }
+  });
+
+  const [matchCount, setMatchCount] = useState<number>(() => {
+    if (typeof window === "undefined") return 5;
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return 5;
+      const data = JSON.parse(raw) as Partial<StoredState>;
+      if (typeof data.matchCount === "number") return data.matchCount;
+      return 5;
+    } catch {
+      return 5;
+    }
+  });
+
+  const [priorityMode, setPriorityMode] = useState<PriorityMode>(() => {
+    if (typeof window === "undefined") return "none";
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return "none";
+      const data = JSON.parse(raw) as Partial<StoredState>;
+      if (
+        data.priorityMode === "none" ||
+        data.priorityMode === "level" ||
+        data.priorityMode === "gender"
+      ) {
+        return data.priorityMode;
+      }
+      return "none";
+    } catch {
+      return "none";
+    }
+  });
+
   const [newParticipantName, setNewParticipantName] = useState("");
   const [newParticipantLevel, setNewParticipantLevel] = useState(4);
   const [newParticipantGender, setNewParticipantGender] = useState<Gender>("M");
 
-  // ▼ 各プレーヤーの設定（レベル・性別）
-  const [playerSettings, setPlayerSettings] = useState<
-    Record<string, PlayerSettings>
-  >(() => {
-    const stored = getStoredState();
-    if (
-      stored &&
-      stored.playerSettings &&
-      typeof stored.playerSettings === "object"
-    ) {
-      return stored.playerSettings;
-    }
-    return {};
-  });
+  const [pairPickerOpen, setPairPickerOpen] = useState<
+    null | "fixed" | "forbidden"
+  >(null);
+  const [pairPickerSelection, setPairPickerSelection] = useState<string[]>([]);
 
-  const getSettings = (name: string): PlayerSettings => {
-    return playerSettings[name] ?? DEFAULT_SETTINGS;
-  };
+  const [rounds, setRounds] = useState<RoundView[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const getSettings = (name: string): PlayerSettings =>
+    playerSettings[name] ?? DEFAULT_SETTINGS;
 
   const updateSettings = (name: string, patch: Partial<PlayerSettings>) => {
     setPlayerSettings((prev) => {
@@ -564,107 +540,41 @@ export default function Page() {
     });
   };
 
-  // ▼ 制約：固定ペア・禁止ペア
-  const [fixedPairs, setFixedPairs] = useState<Team[]>(() => {
-    const stored = getStoredState();
-    if (stored && Array.isArray(stored.fixedPairs)) {
-      return stored.fixedPairs;
+  // 状態が変わるたび localStorage に保存
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const data: StoredState = {
+      participants,
+      playerSettings,
+      fixedPairs,
+      forbiddenPairs,
+      courtCount,
+      matchCount,
+      priorityMode,
+    };
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    } catch (e) {
+      console.error("Failed to save state", e);
     }
-    return [];
-  });
+  }, [
+    participants,
+    playerSettings,
+    fixedPairs,
+    forbiddenPairs,
+    courtCount,
+    matchCount,
+    priorityMode,
+  ]);
 
-  const [forbiddenPairs, setForbiddenPairs] = useState<Team[]>(() => {
-    const stored = getStoredState();
-    if (stored && Array.isArray(stored.forbiddenPairs)) {
-      return stored.forbiddenPairs;
-    }
-    return [];
-  });
-
-  // ▼ ペア追加用ポップアップ
-  const [pairPickerOpen, setPairPickerOpen] = useState<
-    null | "fixed" | "forbidden"
-  >(null);
-  const [pairPickerSelection, setPairPickerSelection] = useState<string[]>([]);
-
-  // ▼ メンバー管理 & 参加者追加用モーダル
-  const [memberModalOpen, setMemberModalOpen] = useState(false);
-  const [memberModalSelection, setMemberModalSelection] = useState<string[]>(
-    []
-  );
-
-  // ▼ 優先モード
-  const [priorityMode, setPriorityMode] = useState<PriorityMode>(() => {
-    const stored = getStoredState();
-    if (
-      stored &&
-      (stored.priorityMode === "none" ||
-        stored.priorityMode === "level" ||
-        stored.priorityMode === "gender")
-    ) {
-      return stored.priorityMode;
-    }
-    return "none";
-  });
-
-  // ▼ 条件
-  const [courtCount, setCourtCount] = useState(() => {
-    const stored = getStoredState();
-    if (stored && typeof stored.courtCount === "number") {
-      return stored.courtCount;
-    }
-    return 2;
-  });
-
-  const [matchCount, setMatchCount] = useState(() => {
-    const stored = getStoredState();
-    if (stored && typeof stored.matchCount === "number") {
-      return stored.matchCount;
-    }
-    return 3;
-  });
-
-  const [rounds, setRounds] = useState<RoundView[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  // ▼ メンバー管理用関数
-  const addMember = (name: string) => {
-    const trimmed = name.trim();
-    if (!trimmed) return;
-    setMembers((prev) => (prev.includes(trimmed) ? prev : [...prev, trimmed]));
-  };
-
-  const removeMember = (name: string) => {
-    // 在籍メンバーから削除
-    setMembers((prev) => prev.filter((m) => m !== name));
-    // 参加者からも削除
-    setParticipants((prev) => prev.filter((p) => p !== name));
-    // 固定／禁止ペアから除外
-    setFixedPairs((prev) => prev.filter(([a, b]) => a !== name && b !== name));
-    setForbiddenPairs((prev) =>
-      prev.filter(([a, b]) => a !== name && b !== name)
-    );
-    // 設定も削除
-    setPlayerSettings((prev) => {
-      const copy = { ...prev };
-      delete copy[name];
-      return copy;
-    });
-    // モーダル内の選択からも外す
-    setMemberModalSelection((prev) => prev.filter((n) => n !== name));
-  };
-
-  // ▼ プレイヤーカード（名前 + Lv + 性別色）
   const PlayerCard = ({ name }: { name: string }) => {
     const s = getSettings(name);
     const isMale = s.gender === "M";
-
     const baseClasses =
       "flex flex-col items-center justify-center rounded-lg border px-2 py-1 min-w-[72px]";
     const colorClasses = isMale
       ? "bg-sky-100 border-sky-300"
       : "bg-rose-100 border-rose-300";
-
     return (
       <div className={`${baseClasses} ${colorClasses}`}>
         <div className="text-[10px] font-semibold text-slate-600">
@@ -691,59 +601,35 @@ export default function Page() {
     );
   };
 
-  const handleAddNewMember = () => {
-    addMember(newMemberName);
-    setNewMemberName("");
+  const toggleMemberParticipant = (member: string) => {
+    setParticipants((prev) =>
+      prev.includes(member)
+        ? prev.filter((p) => p !== member)
+        : [...prev, member]
+    );
+    if (participants.includes(member)) {
+      setFixedPairs((prev) =>
+        prev.filter(([a, b]) => a !== member && b !== member)
+      );
+      setForbiddenPairs((prev) =>
+        prev.filter(([a, b]) => a !== member && b !== member)
+      );
+    }
   };
 
   const handleAddNewParticipant = () => {
     const name = newParticipantName.trim();
     if (!name) return;
-
-    // 参加者として追加（ビジター）
     addParticipant(name);
-
-    // レベル・性別も同時に設定
     updateSettings(name, {
       level: newParticipantLevel,
       gender: newParticipantGender,
     });
-
-    // 入力欄をリセット
     setNewParticipantName("");
     setNewParticipantLevel(4);
     setNewParticipantGender("M");
   };
 
-  // メンバー選択モーダル操作
-  const openMemberModal = () => {
-    setMemberModalOpen(true);
-    setMemberModalSelection([]);
-  };
-
-  const closeMemberModal = () => {
-    setMemberModalOpen(false);
-    setMemberModalSelection([]);
-  };
-
-  const toggleMemberModalSelection = (name: string) => {
-    setMemberModalSelection((prev) =>
-      prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]
-    );
-  };
-
-  const handleAddMembersToParticipants = () => {
-    if (memberModalSelection.length > 0) {
-      setParticipants((prev) => {
-        const set = new Set(prev);
-        memberModalSelection.forEach((n) => set.add(n));
-        return Array.from(set);
-      });
-    }
-    closeMemberModal();
-  };
-
-  // ペア選択モーダル
   const openPairPicker = (mode: "fixed" | "forbidden") => {
     setPairPickerOpen(mode);
     setPairPickerSelection([]);
@@ -754,19 +640,14 @@ export default function Page() {
       if (prev.includes(name)) {
         return prev.filter((n) => n !== name);
       }
-      if (prev.length >= 2) {
-        return prev; // 2人以上は選べない
-      }
+      if (prev.length >= 2) return prev;
       return [...prev, name];
     });
   };
 
   const handleConfirmPair = () => {
-    if (!pairPickerOpen || pairPickerSelection.length !== 2) {
-      return;
-    }
+    if (!pairPickerOpen || pairPickerSelection.length !== 2) return;
     const sorted = [...pairPickerSelection].sort() as Team;
-
     if (pairPickerOpen === "fixed") {
       setFixedPairs((prev) =>
         prev.some((p) => p[0] === sorted[0] && p[1] === sorted[1])
@@ -780,7 +661,6 @@ export default function Page() {
           : [...prev, sorted]
       );
     }
-
     setPairPickerOpen(null);
     setPairPickerSelection([]);
   };
@@ -800,14 +680,11 @@ export default function Page() {
   const handleGenerate = () => {
     const uniqueNames = Array.from(new Set(participants));
 
-    if (uniqueNames.length < 2) {
-      setError(
-        "参加者は2人以上必要です。サークルメンバーやビジターを登録してください。"
-      );
+    if (uniqueNames.length < 4) {
+      setError("最低でも4人以上の参加者が必要です。");
       setRounds(null);
       return;
     }
-
     if (courtCount <= 0) {
       setError("コート数は1以上を指定してください。");
       setRounds(null);
@@ -816,11 +693,7 @@ export default function Page() {
 
     const players: Player[] = uniqueNames.map((name) => {
       const s = getSettings(name);
-      return {
-        name,
-        level: s.level,
-        gender: s.gender,
-      };
+      return { name, level: s.level, gender: s.gender };
     });
 
     const effectiveFixed = fixedPairs.filter(
@@ -850,40 +723,11 @@ export default function Page() {
     }
   };
 
-  // ▼ 状態が変わるたびに localStorage に保存
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const data: StoredState = {
-      members,
-      participants,
-      playerSettings,
-      fixedPairs,
-      forbiddenPairs,
-      courtCount,
-      matchCount,
-      priorityMode,
-    };
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-    } catch (e) {
-      console.error("Failed to save state to localStorage", e);
-    }
-  }, [
-    members,
-    participants,
-    playerSettings,
-    fixedPairs,
-    forbiddenPairs,
-    courtCount,
-    matchCount,
-    priorityMode,
-  ]);
-
   return (
     <main className="min-h-screen bg-gradient-to-br from-sky-50 via-slate-50 to-emerald-50 px-3 py-6 md:px-6 md:py-10">
       <div className="mx-auto flex max-w-6xl flex-col gap-4 md:flex-row">
-        {/* 左側：参加者・条件の設定パネル */}
-        <section className="w全 space-y-4 md:w-[45%]">
+        {/* 左パネル */}
+        <section className="w-full space-y-4 md:w-[45%]">
           {/* タイトル */}
           <div className="rounded-2xl bg-white/90 p-4 shadow-md ring-1 ring-slate-200 md:p-5">
             <div className="mb-3 flex items-center justify-between gap-2">
@@ -903,8 +747,6 @@ export default function Page() {
                 🎾
               </span>
             </div>
-
-            {/* 参加者のサマリ */}
             <div className="mt-2 flex items-center justify-between rounded-xl bg-slate-50 px-3 py-2 text-xs">
               <div className="space-x-3">
                 <span className="inline-flex items-center gap-1 rounded-full bg-sky-100 px-2 py-0.5 font-semibold text-sky-800">
@@ -915,37 +757,84 @@ export default function Page() {
                 </span>
               </div>
               <span className="text-[11px] text-slate-500">
-                サークルメンバー: {members.length} 名
+                メンバーDB: {MEMBER_DATABASE.length} 名
               </span>
             </div>
           </div>
 
-          {/* 参加者設定（メイン画面） */}
+          {/* 参加者設定 */}
           <div className="rounded-2xl bg-white/90 p-4 shadow-md ring-1 ring-slate-200 md:p-5">
             <h2 className="mb-2 text-sm font-semibold text-slate-800">
-              今日の参加者の設定
+              参加者の設定
             </h2>
 
-            {/* メンバーから追加ボタン */}
-            <div className="mb-3 flex items-center justify-between gap-2">
-              <div className="text-[11px] text-slate-600">
-                サークル在籍メンバーを一覧で確認し、そこから今日の参加者を追加できます。
+            {/* サークルメンバー一覧 */}
+            <div className="mb-3">
+              <div className="mb-1 flex items-center justify-between text-[11px] text-slate-600">
+                <span>サークルメンバー（チェックすると参加者に登録）</span>
+                <span>レベル/性別は右で設定</span>
               </div>
-              <button
-                type="button"
-                onClick={openMemberModal}
-                className="inline-flex items-center rounded-full bg-slate-800 px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm hover:bg-slate-900"
-              >
-                メンバー一覧を開く
-              </button>
+              <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs">
+                {MEMBER_DATABASE.map((member) => {
+                  const checked = participants.includes(member);
+                  const s = getSettings(member);
+                  return (
+                    <div
+                      key={member}
+                      className="flex items-center justify-between rounded-md px-1 py-0.5 hover:bg-sky-50"
+                    >
+                      <label className="flex flex-1 cursor-pointer items-center gap-1.5">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleMemberParticipant(member)}
+                          className="h-3.5 w-3.5 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                        />
+                        <span>{member}</span>
+                      </label>
+                      <div className="flex items-center gap-1.5 text-[10px]">
+                        <select
+                          value={s.level}
+                          onChange={(e) =>
+                            updateSettings(member, {
+                              level: Number(e.target.value) || 4,
+                            })
+                          }
+                          className="rounded border border-slate-300 bg-white px-1 py-0.5"
+                        >
+                          {Array.from({ length: 8 }, (_, i) => i + 1).map(
+                            (lv) => (
+                              <option key={lv} value={lv}>
+                                Lv{lv}
+                              </option>
+                            )
+                          )}
+                        </select>
+                        <select
+                          value={s.gender}
+                          onChange={(e) =>
+                            updateSettings(member, {
+                              gender: e.target.value as Gender,
+                            })
+                          }
+                          className="rounded border border-slate-300 bg-white px-1 py-0.5"
+                        >
+                          <option value="M">男</option>
+                          <option value="F">女</option>
+                        </select>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
 
-            {/* ビジター・個別追加 */}
+            {/* ビジター追加 */}
             <div className="mb-3">
               <label className="mb-1 block text-xs font-semibold text-slate-700">
                 ビジター / 個別追加
                 <span className="ml-1 text-[11px] font-normal text-slate-500">
-                  ※名前・レベル・性別を設定して今日の参加者に追加
+                  ※名前・レベル・性別を設定して参加者に追加
                 </span>
               </label>
               <div className="flex flex-col gap-2 md:flex-row md:items-center">
@@ -956,7 +845,6 @@ export default function Page() {
                   placeholder="例）ビジターAさん"
                   className="flex-1 rounded-lg border border-slate-300 px-2 py-1.5 text-xs md:text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40"
                 />
-
                 <div className="flex items-center gap-2 text-[11px]">
                   <div className="flex items-center gap-1">
                     <span className="text-slate-600">Lv</span>
@@ -974,7 +862,6 @@ export default function Page() {
                       ))}
                     </select>
                   </div>
-
                   <div className="flex items-center gap-1">
                     <span className="text-slate-600">性別</span>
                     <select
@@ -988,7 +875,6 @@ export default function Page() {
                       <option value="F">女</option>
                     </select>
                   </div>
-
                   <button
                     type="button"
                     onClick={handleAddNewParticipant}
@@ -1000,19 +886,19 @@ export default function Page() {
               </div>
             </div>
 
-            {/* 現在の参加者一覧（削除用） */}
+            {/* 現在の参加者 */}
             <div className="mb-3">
               <div className="mb-1 flex items-center justify-between">
                 <span className="text-xs font-semibold text-slate-700">
-                  今日の参加者
+                  現在の参加者
                 </span>
                 <span className="text-[11px] text-slate-500">
-                  バッジをクリックで参加者から削除（在籍は残ります）
+                  バッジをクリックで削除
                 </span>
               </div>
               {participants.length === 0 ? (
                 <p className="rounded-lg bg-slate-50 px-3 py-2 text-[11px] text-slate-500">
-                  まだ参加者が登録されていません。メンバー一覧を開くか、ビジターを追加してください。
+                  まだ参加者が登録されていません。メンバーにチェックを入れるか、ビジターを追加してください。
                 </p>
               ) : (
                 <div className="flex flex-wrap gap-1.5 rounded-lg bg-slate-50 px-2.5 py-2">
@@ -1033,7 +919,7 @@ export default function Page() {
               )}
             </div>
 
-            {/* 参加者ごとのレベル・性別設定 */}
+            {/* 参加者のレベル・性別 */}
             {participants.length > 0 && (
               <div>
                 <div className="mb-1 text-xs font-semibold text-slate-700">
@@ -1087,13 +973,13 @@ export default function Page() {
             )}
           </div>
 
-          {/* 条件設定・制約 */}
+          {/* 条件・制約 */}
           <div className="rounded-2xl bg-white/90 p-4 shadow-md ring-1 ring-slate-200 md:p-5">
             <h2 className="mb-2 text-sm font-semibold text-slate-800">
               試合条件・制約
             </h2>
 
-            {/* 優先モード選択 */}
+            {/* 優先モード */}
             <div className="mb-3">
               <div className="text-xs font-semibold text-slate-700">
                 組み合わせの優先項目
@@ -1149,7 +1035,9 @@ export default function Page() {
                   type="number"
                   min={1}
                   value={courtCount}
-                  onChange={(e) => setCourtCount(Number(e.target.value) || 1)}
+                  onChange={(e) =>
+                    setCourtCount(Math.max(1, Number(e.target.value) || 1))
+                  }
                   className="block w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40"
                 />
               </div>
@@ -1210,7 +1098,6 @@ export default function Page() {
                   </div>
                 )}
               </div>
-
               <div>
                 <div className="mb-1 flex items-center justify-between">
                   <span className="text-xs font-semibold text-slate-700">
@@ -1266,7 +1153,7 @@ export default function Page() {
           </div>
         </section>
 
-        {/* 右側：結果パネル */}
+        {/* 右パネル：結果 */}
         <section className="w-full rounded-2xl bg-white/95 p-4 shadow-md ring-1 ring-slate-200 md:w-[55%] md:p-6">
           <div className="mb-4 flex items-center justify-between gap-2">
             <h2 className="flex items-center gap-2 text-sm font-semibold text-slate-800 md:text-base">
@@ -1276,7 +1163,7 @@ export default function Page() {
               組み合わせ結果
             </h2>
             <p className="text-[11px] text-slate-500">
-              優先設定と固定/禁止ペアを考慮して組み合わせを生成しています。
+              優先設定・固定/禁止ペア・出場回数・レベル差などを考慮してスコアが小さい案を選んでいます。
             </p>
           </div>
 
@@ -1366,7 +1253,7 @@ export default function Page() {
         </section>
       </div>
 
-      {/* ペア選択用ポップアップ */}
+      {/* ペア選択モーダル */}
       {pairPickerOpen && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/30 px-3">
           <div className="w-full max-w-sm rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
@@ -1435,127 +1322,6 @@ export default function Page() {
                 }`}
               >
                 追加
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* メンバー管理 & 参加者追加モーダル */}
-      {memberModalOpen && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/30 px-3">
-          <div className="w-full max-w-md rounded-2xl bg-white p-4 shadow-xl ring-1 ring-slate-200">
-            <h3 className="mb-1 text-sm font-semibold text-slate-800">
-              サークルメンバー管理 & 参加者追加
-            </h3>
-            <p className="mb-2 text-[11px] text-slate-500">
-              サークル在籍メンバーを管理し、今日の参加者として追加したい人にチェックを入れてください。
-            </p>
-
-            {/* メンバー追加 */}
-            <div className="mb-2 flex flex-col gap-2 md:flex-row md:items-center">
-              <input
-                type="text"
-                value={newMemberName}
-                onChange={(e) => setNewMemberName(e.target.value)}
-                placeholder="例）佐藤さん"
-                className="flex-1 rounded-lg border border-slate-300 px-2 py-1.5 text-xs md:text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40"
-              />
-              <button
-                type="button"
-                onClick={handleAddNewMember}
-                className="inline-flex items-center justify-center rounded-full bg-slate-800 px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm hover:bg-slate-900"
-              >
-                メンバー追加
-              </button>
-            </div>
-
-            {/* メンバー一覧 */}
-            <div className="max-h-64 space-y-1 overflow-y-auto rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs">
-              {members.length === 0 && (
-                <p className="px-1 py-1 text-[11px] text-slate-500">
-                  まだサークルメンバーが登録されていません。上の欄から追加してください。
-                </p>
-              )}
-              {members.map((name) => {
-                const checked = memberModalSelection.includes(name);
-                const s = getSettings(name);
-                return (
-                  <div
-                    key={name}
-                    className="flex items-center justify-between gap-1 rounded-md px-1 py-0.5 hover:bg-sky-50"
-                  >
-                    <label className="flex flex-1 cursor-pointer items-center gap-1.5">
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={() => toggleMemberModalSelection(name)}
-                        className="h-3.5 w-3.5 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
-                      />
-                      <span className="truncate">{name}</span>
-                    </label>
-                    <div className="flex items-center gap-1.5 text-[10px]">
-                      <select
-                        value={s.level}
-                        onChange={(e) =>
-                          updateSettings(name, {
-                            level: Number(e.target.value) || 4,
-                          })
-                        }
-                        className="rounded border border-slate-300 bg-white px-1 py-0.5"
-                      >
-                        {Array.from({ length: 8 }, (_, i) => i + 1).map(
-                          (lv) => (
-                            <option key={lv} value={lv}>
-                              Lv{lv}
-                            </option>
-                          )
-                        )}
-                      </select>
-                      <select
-                        value={s.gender}
-                        onChange={(e) =>
-                          updateSettings(name, {
-                            gender: e.target.value as Gender,
-                          })
-                        }
-                        className="rounded border border-slate-300 bg-white px-1 py-0.5"
-                      >
-                        <option value="M">男</option>
-                        <option value="F">女</option>
-                      </select>
-                      <button
-                        type="button"
-                        onClick={() => removeMember(name)}
-                        className="rounded-full bg-red-50 px-2 py-0.5 text-[10px] text-red-600 hover:bg-red-100"
-                      >
-                        削除
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-
-            <div className="mt-3 flex justify-end gap-2 text-xs">
-              <button
-                type="button"
-                onClick={closeMemberModal}
-                className="rounded-full border border-slate-300 px-3 py-1.5 text-slate-600 hover:bg-slate-50"
-              >
-                閉じる
-              </button>
-              <button
-                type="button"
-                onClick={handleAddMembersToParticipants}
-                disabled={memberModalSelection.length === 0}
-                className={`rounded-full px-3 py-1.5 font-semibold text-white ${
-                  memberModalSelection.length > 0
-                    ? "bg-sky-600 hover:bg-sky-700"
-                    : "cursor-not-allowed bg-sky-300"
-                }`}
-              >
-                参加者に追加
               </button>
             </div>
           </div>
