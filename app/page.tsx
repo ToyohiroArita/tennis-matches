@@ -14,6 +14,7 @@ type RoundView = {
   roundIndex: number;
   courts: CourtMatch[];
   restingPlayers: string[];
+  score?: number; // ★ デバッグ用スコア
 };
 
 type PlayerSettings = {
@@ -117,27 +118,162 @@ function pairKey(a: string, b: string): string {
   return `${x}::${y}`;
 }
 
+function matchupKey(team1: Team, team2: Team): string {
+  // 4人分の名前をソートして一意なキーにする（順番・コートは関係なく同じ対戦とみなす）
+  const names = [...team1, ...team2].sort();
+  return names.join("::");
+}
+
+// 1ラウンド分の組み合わせにスコアを付ける
+// スコアが小さいほど「良い」案
+function scoreCandidateRound(
+  courts: CourtMatch[],
+  roundIndex: number,
+  gamesCount: Record<string, number>,
+  lastPlayedRound: Record<string, number>,
+  levelMap: Record<string, number>,
+  pastMatchupLastRound: Map<string, number>,
+  pastMatchupCount: Map<string, number>,
+  fixedPairs: Team[]
+): number {
+  let score = 0;
+
+  // このラウンドで試合に出るプレーヤー集合
+  const playedThisRound = new Set<string>();
+  for (const court of courts) {
+    court.team1.forEach((name) => playedThisRound.add(name));
+    court.team2?.forEach((name) => playedThisRound.add(name));
+  }
+
+  // ① 連続出場ペナルティ（前ラウンドも出ていた人）
+  for (const name of playedThisRound) {
+    if ((lastPlayedRound[name] ?? -1) === roundIndex - 1) {
+      score += 3; // 連続出場1人あたり +3
+    }
+  }
+
+  // このラウンドの「どのプレーヤーがどのチームか」をマッピング
+  const teamIdByPlayer: Record<string, string> = {};
+  for (const court of courts) {
+    const t1id = `R${roundIndex}-C${court.court}-T1`;
+    const t2id = `R${roundIndex}-C${court.court}-T2`;
+    court.team1.forEach((name) => {
+      teamIdByPlayer[name] = t1id;
+    });
+    court.team2?.forEach((name) => {
+      teamIdByPlayer[name] = t2id;
+    });
+  }
+
+  // ② 固定ペアの扱い（ペナルティ方式）
+  for (const [a, b] of fixedPairs) {
+    const aIn = playedThisRound.has(a);
+    const bIn = playedThisRound.has(b);
+
+    if (aIn && bIn) {
+      const ta = teamIdByPlayer[a];
+      const tb = teamIdByPlayer[b];
+      if (ta && tb) {
+        if (ta === tb) {
+          // 同じチームで出場 → ちょっとだけご褒美
+          score -= 5;
+        } else {
+          // 同じラウンドに出ているのに別チーム → ペナルティ（少し軽め）
+          score += 20;
+        }
+      }
+    }
+    // 片方だけ出ている / 片方休憩は今回はノーペナルティにしておく
+  }
+
+  // ③ レベル差 & 同じ対戦の繰り返し
+  for (const court of courts) {
+    if (!court.team2) continue; // 相手チームがいない場合はスキップ
+
+    const sum1 = court.team1.reduce(
+      (acc, name) => acc + (levelMap[name] ?? 4),
+      0
+    );
+    const sum2 = court.team2.reduce(
+      (acc, name) => acc + (levelMap[name] ?? 4),
+      0
+    );
+    const diff = Math.abs(sum1 - sum2);
+
+    // レベル差ペナルティ：差2まではOK、超えた分だけ二乗で重くする
+    if (diff > 2) {
+      const over = diff - 2;
+      score += over * over * 10; // 重み10（必要に応じてチューニング）
+    }
+
+    // 同じ4人カードの繰り返し
+    const key = matchupKey(court.team1 as Team, court.team2 as Team);
+    const lastRound = pastMatchupLastRound.get(key);
+    const countSoFar = pastMatchupCount.get(key) ?? 0; // これまで何回この4人で対戦したか
+
+    if (lastRound !== undefined) {
+      const gap = roundIndex - lastRound; // 何試合ぶりか
+
+      // 他のペナルティ（レベル差・出場回数など）がせいぜい数百〜数千点なので、
+      // ここは「桁を2〜3つ」上げて、ほぼ禁止レベルにする。
+      const HARD_BASE = 1_000_000; // 基本スケール
+
+      let basePenalty = 0;
+      if (gap <= 5) {
+        // 5試合以内に同じ4人は、原則ほぼNG
+        basePenalty = HARD_BASE;
+      } else if (gap <= 10) {
+        // 6〜10試合ぶりでもかなり重め
+        basePenalty = HARD_BASE / 5; // 200,000
+      } else {
+        // それ以降は「たまには同じ対戦もあり」程度だが、それでもそこそこ重い
+        basePenalty = HARD_BASE / 20; // 50,000
+      }
+
+      // 繰り返し回数による増幅：
+      // 2回目: (1+1)^2 = 4倍, 3回目: 9倍, 4回目: 16倍...
+      const repeatFactor = (countSoFar + 1) * (countSoFar + 1);
+
+      score += basePenalty * repeatFactor;
+    }
+  }
+
+  // ④ 出場回数の偏り（この案を採用した場合の仮の gamesCount で評価）
+  const tmpGames: Record<string, number> = { ...gamesCount };
+  for (const name of playedThisRound) {
+    tmpGames[name] = (tmpGames[name] ?? 0) + 1;
+  }
+
+  let minGames = Infinity;
+  let maxGames = -Infinity;
+  for (const name in tmpGames) {
+    const g = tmpGames[name];
+    if (g < minGames) minGames = g;
+    if (g > maxGames) maxGames = g;
+  }
+
+  if (minGames !== Infinity && maxGames !== -Infinity) {
+    const diffGames = maxGames - minGames;
+    score += diffGames * 4; // 出場回数の差 ×4
+  }
+
+  return score;
+}
+
 // 1試合分のペアを作る
-// 前試合のペア＋固定ペア＋禁止ペア＋優先モード＋公平性（出場回数）を考慮
+// 前試合のペア＋禁止ペア＋優先モード＋公平性（出場回数）を考慮
 function findRoundPairing(
   players: Player[],
   prevPairsSet: Set<string> | null,
-  fixedPairs: Team[],
+  fixedPairs: Team[], // ★ ここでは使わず、スコア側で評価する
   forbiddenPairs: Team[],
   priorityMode: PriorityMode,
   gamesCount: Record<string, number>,
   lastPlayedRound: Record<string, number>
 ): { teams: Team[]; resting: string[] } | null {
-  // ★ここでは並び替えはせず、外側から受け取った順序をそのまま使う
   const order = [...players];
 
   const forbiddenSet = new Set(forbiddenPairs.map(([a, b]) => pairKey(a, b)));
-
-  const fixedMap = new Map<string, string>();
-  for (const [a, b] of fixedPairs) {
-    fixedMap.set(a, b);
-    fixedMap.set(b, a);
-  }
 
   const used = new Set<string>();
   const teams: Team[] = [];
@@ -149,20 +285,10 @@ function findRoundPairing(
     }
 
     const p1 = remaining[0];
-    const fixedPartnerName = fixedMap.get(p1.name);
-    let candidates: Player[];
+    let candidates: Player[] = remaining.slice(1);
 
-    if (fixedPartnerName) {
-      const fixedPartner = remaining.find((p) => p.name === fixedPartnerName);
-      if (!fixedPartner) {
-        return false; // 今回の試合で固定ペアを組めない
-      }
-      candidates = [fixedPartner];
-    } else {
-      candidates = remaining.slice(1);
-    }
-
-    // ★候補のソートに「出場回数」「最後に出たラウンド」を強く反映させる
+    // ★候補のソートに「出場回数」「最後に出たラウンド」も反映しつつ、
+    //   level / gender の優先モードを加味する
     if (priorityMode === "level") {
       candidates.sort((a, b) => {
         const ga = gamesCount[a.name] ?? 0;
@@ -227,7 +353,8 @@ function findRoundPairing(
 }
 
 // 複数試合分を生成（1〜matchCount）
-// ★各プレーヤーの「試合数」と「最後に出たラウンド」を見て、なるべく公平に回す
+// 公平性（出場回数・連続出場）とレベル差、同じ対戦の繰り返しをスコアリングして、
+// スコアが最小の案を各ラウンドで採用する。
 function generateRounds(
   players: Player[],
   courtCount: number,
@@ -238,38 +365,47 @@ function generateRounds(
 ): RoundView[] | null {
   const rounds: RoundView[] = [];
 
-  // 各プレーヤーの試合数と最後に出たラウンドを記録
+  // 各プレーヤーの試合数と最後に出たラウンド
   const gamesCount: Record<string, number> = {};
   const lastPlayedRound: Record<string, number> = {};
+  const levelMap: Record<string, number> = {};
 
   for (const p of players) {
     gamesCount[p.name] = 0;
-    lastPlayedRound[p.name] = -1; // まだ一度も出ていない
+    lastPlayedRound[p.name] = -1;
+    levelMap[p.name] = p.level;
   }
 
-  // 直前ラウンドで組まれたペア（次のラウンドで同じペアを避ける）
+  // 直前ラウンドで実際に試合したペア集合（次ラウンドで同じペアを禁止するため）
   let prevPairsSet: Set<string> | null = null;
 
+  // 過去の「対戦カード（4人）」の最後に出たラウンド
+  const pastMatchupLastRound = new Map<string, number>();
+  // 過去の「対戦カード（4人）」が何回登場したか
+  const pastMatchupCount = new Map<string, number>();
+
   for (let roundIndex = 0; roundIndex < matchCount; roundIndex++) {
-    let result: { teams: Team[]; resting: string[] } | null = null;
+    let bestScore = Infinity;
+    let bestCourts: CourtMatch[] | null = null;
+    let bestResting: string[] = [];
+    let bestTeamsForPrevPairs: Team[] | null = null;
 
-    // ★「試合数が少なく」「最近出ていない」人から優先して並べる
-    const sortedPlayers = [...players].sort((a, b) => {
-      const ga = gamesCount[a.name] ?? 0;
-      const gb = gamesCount[b.name] ?? 0;
-      if (ga !== gb) return ga - gb; // 試合数が少ない人を優先
+    // 同じ条件で複数パターンを試して、一番スコアの良いものを採用
+    for (let attempt = 0; attempt < 60; attempt++) {
+      // 公平性を考慮して並び替え（試合数が少ない & 最近出ていない人を優先）
+      const sortedPlayers = [...players].sort((a, b) => {
+        const ga = gamesCount[a.name] ?? 0;
+        const gb = gamesCount[b.name] ?? 0;
+        if (ga !== gb) return ga - gb;
 
-      const la = lastPlayedRound[a.name] ?? -1;
-      const lb = lastPlayedRound[b.name] ?? -1;
-      if (la !== lb) return la - lb; // 最近出ていない人を優先
+        const la = lastPlayedRound[a.name] ?? -1;
+        const lb = lastPlayedRound[b.name] ?? -1;
+        if (la !== lb) return la - lb;
 
-      // 同条件なら少しランダム性を入れる
-      return Math.random() - 0.5;
-    });
+        return Math.random() - 0.5; // 完全同条件ならランダム
+      });
 
-    // バックトラッキングでペア決定（最大100回トライ）
-    for (let attempt = 0; attempt < 100; attempt++) {
-      result = findRoundPairing(
+      const pairing = findRoundPairing(
         sortedPlayers,
         prevPairsSet,
         fixedPairs,
@@ -278,37 +414,56 @@ function generateRounds(
         gamesCount,
         lastPlayedRound
       );
+      if (!pairing) continue;
 
-      if (result) break;
+      const teams = pairing.teams;
+      const restingPlayers = [...pairing.resting];
+      const courts: CourtMatch[] = [];
+      const teamsForCourt = [...teams];
+
+      let courtNo = 1;
+      while (courtNo <= courtCount && teamsForCourt.length >= 2) {
+        const team1 = teamsForCourt.shift()!;
+        const team2 = teamsForCourt.shift()!;
+        courts.push({ court: courtNo, team1, team2 });
+        courtNo++;
+      }
+      // コートに載りきれなかったペアは休憩扱い
+      teamsForCourt.forEach((team) => {
+        restingPlayers.push(...team);
+      });
+
+      // ★ この案のスコアを計算
+      const score = scoreCandidateRound(
+        courts,
+        roundIndex,
+        gamesCount,
+        lastPlayedRound,
+        levelMap,
+        pastMatchupLastRound,
+        pastMatchupCount,
+        fixedPairs
+      );
+
+      if (score < bestScore) {
+        bestScore = score;
+        bestCourts = courts;
+        bestResting = restingPlayers;
+        bestTeamsForPrevPairs = teams;
+
+        // 全てのペナルティが0なら理想案なので、ここで打ち切り
+        if (score === 0) break;
+      }
     }
 
-    if (!result) {
+    // このラウンドの案がどうしても見つからなかった場合
+    if (!bestCourts || !bestTeamsForPrevPairs) {
       return null;
     }
 
-    const teams = result.teams;
-    const restingPlayers: string[] = [...result.resting];
-
-    const courts: CourtMatch[] = [];
-    const teamsForCourt = [...teams];
-
-    // 実際にコートで試合するペアを割り当て
-    let courtNo = 1;
-    while (courtNo <= courtCount && teamsForCourt.length >= 2) {
-      const team1 = teamsForCourt.shift()!;
-      const team2 = teamsForCourt.shift()!;
-      courts.push({ court: courtNo, team1, team2 });
-      courtNo++;
-    }
-
-    // コートに割り当てられなかったペアは「休憩」に回す
-    teamsForCourt.forEach((team) => {
-      restingPlayers.push(...team);
-    });
-
-    // ★今回実際に「試合に出た人」だけ gamesCount / lastPlayedRound を更新
+    // 実際に試合に出た人だけ、出場回数・最終出場ラウンドを更新
     const playedThisRound = new Set<string>();
-    for (const court of courts) {
+    for (const court of bestCourts) {
       court.team1.forEach((name) => playedThisRound.add(name));
       court.team2?.forEach((name) => playedThisRound.add(name));
     }
@@ -317,9 +472,9 @@ function generateRounds(
       lastPlayedRound[name] = roundIndex;
     }
 
-    // ★直前ラウンドのペア集合は「実際に試合したペア」のみ対象にする
+    // 次ラウンドで「直前ペア禁止」にする集合を更新
     const currentPairs: string[] = [];
-    for (const court of courts) {
+    for (const court of bestCourts) {
       if (court.team1.length === 2) {
         currentPairs.push(pairKey(court.team1[0], court.team1[1]));
       }
@@ -329,7 +484,25 @@ function generateRounds(
     }
     prevPairsSet = new Set(currentPairs);
 
-    rounds.push({ roundIndex, courts, restingPlayers });
+    // 対戦カード（4人）の履歴を更新
+    for (const court of bestCourts) {
+      if (!court.team2) continue;
+      const key = matchupKey(court.team1 as Team, court.team2 as Team);
+
+      // 最後に出たラウンド番号
+      pastMatchupLastRound.set(key, roundIndex);
+
+      // 出現回数
+      const prevCount = pastMatchupCount.get(key) ?? 0;
+      pastMatchupCount.set(key, prevCount + 1);
+    }
+
+    rounds.push({
+      roundIndex,
+      courts: bestCourts,
+      restingPlayers: bestResting,
+      score: bestScore, // ★ このラウンドで採用された案のスコア
+    });
   }
 
   return rounds;
@@ -989,7 +1162,7 @@ export default function Page() {
                   onChange={(e) => setMatchCount(Number(e.target.value))}
                   className="block w-full rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40"
                 >
-                  {[1, 2, 3, 4, 5].map((n) => (
+                  {[5, 10, 15, 20].map((n) => (
                     <option key={n} value={n}>
                       {n} 試合分
                     </option>
@@ -1130,9 +1303,16 @@ export default function Page() {
                         第 {round.roundIndex + 1} 試合
                       </span>
                     </div>
-                    <span className="text-[11px] text-slate-500">
-                      コート数: {round.courts.length}
-                    </span>
+                    <div className="flex flex-col items-end leading-tight">
+                      <span className="text-[11px] text-slate-500">
+                        コート数: {round.courts.length}
+                      </span>
+                      {typeof round.score === "number" && (
+                        <span className="text-[10px] text-slate-400">
+                          スコア: {round.score}
+                        </span>
+                      )}
+                    </div>
                   </div>
 
                   <div className="flex flex-col gap-1.5">
