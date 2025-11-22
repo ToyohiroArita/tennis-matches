@@ -99,7 +99,9 @@ function findRoundPairing(
   forbiddenPairs: Team[],
   priorityMode: PriorityMode
 ): { teams: Team[]; resting: string[] } | null {
-  const order = shuffleArray(players);
+  // ★ 渡された順序（sortedPlayers）をそのまま使う
+  const order = [...players];
+
   const forbiddenSet = new Set(forbiddenPairs.map(([a, b]) => pairKey(a, b)));
 
   const used = new Set<string>();
@@ -213,7 +215,41 @@ function scoreCandidateRound(
     }
   }
 
-  // ③ レベル差
+  // ③ 同じ4人カードの再登場ペナルティ
+  //
+  //   1日のプレーで1人2試合程度が前提なので、
+  //   「同じ4人での再戦」はほぼ最後の手段にしたい。
+  //   → 初回（prevCount=0）はOK
+  //   → 2回目以降は、他のどの要素よりも重いペナルティを付ける。
+  for (const court of courts) {
+    if (!court.team2) continue;
+
+    const key = matchupKey(court.team1 as Team, court.team2 as Team);
+    const prevCount = pastMatchupCount.get(key) ?? 0;
+    const lastRound = pastMatchupLastRound.get(key);
+
+    if (prevCount > 0) {
+      let penalty = 0;
+
+      // ベースをかなり大きくする：
+      //  prevCount=1（2回目）で 100,000点
+      //  prevCount=2（3回目）で 400,000点…
+      const BASE_SAME4 = 100_000;
+      penalty += BASE_SAME4 * (prevCount * prevCount);
+
+      if (lastRound !== undefined) {
+        const gap = roundIndex - lastRound;
+        // 近い間隔での再戦はさらに上乗せ（gap が小さいほど大きい）
+        // 例）gap=1 → 20,000点, gap=3 → 8,000点, gap>=10 → 0
+        const closePenalty = Math.max(0, 20_000 - gap * 2_000);
+        penalty += closePenalty;
+      }
+
+      score += penalty;
+    }
+  }
+
+  // ④ レベル差ペナルティ（差2から発動）
   for (const court of courts) {
     if (!court.team2) continue;
     const sum1 = court.team1.reduce(
@@ -225,28 +261,80 @@ function scoreCandidateRound(
       0
     );
     const diff = Math.abs(sum1 - sum2);
-    if (diff > 2) {
-      const over = diff - 2;
-      score += over * over * 10; // 差が大きいほど急増
+
+    if (diff >= 2) {
+      const over = diff - 1; // diff=2 → over=1（軽め）、diff=3 → over=2（かなり重い）
+      score += over * over * 10;
     }
   }
 
-  // ④ 出場回数の偏り（この案を採用した場合の仮 gamesCount）
+  // ⑤ 出場回数の偏り ＋ ブロック制（割り切れるときだけ強く効かせる）
+
+  // この案を採用した場合の仮 gamesCount
   const tmpGames: Record<string, number> = { ...gamesCount };
   for (const name of playedThisRound) {
     tmpGames[name] = (tmpGames[name] ?? 0) + 1;
   }
 
+  const allNames = Object.keys(levelMap); // 参加者全員（levelMapに載っている人）
+  if (allNames.length === 0) {
+    return score;
+  }
+
+  // ⑤-1 出場回数の差（min/max の差に強めのペナルティ）
   let minGames = Infinity;
   let maxGames = -Infinity;
-  for (const name in tmpGames) {
-    const g = tmpGames[name];
+  for (const name of allNames) {
+    const g = tmpGames[name] ?? 0;
     if (g < minGames) minGames = g;
     if (g > maxGames) maxGames = g;
   }
   if (minGames !== Infinity && maxGames !== -Infinity) {
     const diffGames = maxGames - minGames;
-    score += diffGames * 4;
+    score += diffGames * 25;
+  }
+
+  // ⑤-2 ブロック制：
+  //   blockRounds = （総人数） / （1ラウンドで出場できる人数）が整数のときだけ適用
+  //
+  //   例）12人・1面 → 1ラウンド4人 → 12/4=3 → blockRounds=3
+  //        → 1〜3試合目が第1ブロック、4〜6試合目が第2ブロック
+  //
+  //   各ブロックの最終ラウンドで、
+  //   「そのブロックまでに全員が最低 blockIndex+1 回 出ていること」を強く意識する。
+  const totalPlayers = allNames.length;
+
+  // このラウンドで実際にコートに立っている人数（1面なら常に4人）
+  const playersThisRound = playedThisRound.size;
+
+  if (playersThisRound > 0 && totalPlayers % playersThisRound === 0) {
+    const blockRounds = totalPlayers / playersThisRound; // きれいに割り切れたとき
+
+    if (Number.isInteger(blockRounds) && blockRounds > 0) {
+      // このラウンドが第何ブロック目か（0始まり）
+      const blockIndex = Math.floor(roundIndex / blockRounds);
+      // ブロック内での位置（0,1,2,...）
+      const posInBlock = roundIndex % blockRounds;
+
+      // ブロックの最終ラウンドだけ、強く「全員が最低 blockIndex+1 回」を意識する
+      if (posInBlock === blockRounds - 1) {
+        const requiredMin = blockIndex + 1; // 第1ブロック末:1回以上, 第2ブロック末:2回以上…
+
+        let missingSum = 0;
+        for (const name of allNames) {
+          const g = tmpGames[name] ?? 0;
+          if (g < requiredMin) {
+            // 必要回数に届いていない分だけカウント
+            missingSum += requiredMin - g;
+          }
+        }
+
+        if (missingSum > 0) {
+          // ここはかなり重くして、「ブロック内で誰かが0回のまま」がほぼ起きないようにする
+          score += missingSum * 5000;
+        }
+      }
+    }
   }
 
   return score;
@@ -274,7 +362,7 @@ function generateRounds(
 
   let prevPairsSet: Set<string> | null = null;
 
-  // 同じ4人カードの履歴
+  // 同じ4人カードの履歴（matchupKey = team1+team2 の4人）
   const pastMatchupLastRound = new Map<string, number>();
   const pastMatchupCount = new Map<string, number>();
 
@@ -323,26 +411,23 @@ function generateRounds(
         restingPlayers.push(...team);
       });
 
-      // ★ 同じ4人カードのハード禁止：直近10試合以内はNG
-      const ALLOW_SAME_FOUR_AFTER_ROUNDS = 10;
-      let invalidDueToSame4 = false;
-
+      // ★ 追加：同じ4人セット（team1+team2）の再登場をハード禁止
+      let invalidSameFour = false;
       for (const court of courts) {
-        if (!court.team2) continue;
+        if (!court.team2) continue; // 念のため
+
+        // matchupKey は team1+team2 の4人をソートしてキー化する想定
         const key = matchupKey(court.team1 as Team, court.team2 as Team);
-        const lastRound = pastMatchupLastRound.get(key);
-        if (lastRound !== undefined) {
-          const gap = roundIndex - lastRound;
-          if (gap < ALLOW_SAME_FOUR_AFTER_ROUNDS) {
-            invalidDueToSame4 = true;
-            break;
-          }
+        if (pastMatchupCount.has(key)) {
+          // この4人セットはすでにどこかのラウンドで登場済み → この候補は捨てる
+          invalidSameFour = true;
+          break;
         }
       }
-
-      if (invalidDueToSame4) {
-        continue; // この案は捨てて別の案を試す
+      if (invalidSameFour) {
+        continue; // 別の attempt を試す
       }
+      // ★ ここまでフィルター
 
       const score = scoreCandidateRound(
         courts,
